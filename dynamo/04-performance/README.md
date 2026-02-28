@@ -158,7 +158,51 @@ python3 benchmarks/benchmark_serving.py \
 | Throughput | Lower | Higher | More requests/second at scale |
 | P99 latency | Higher | Lower | Tail latency from KV transfer stalls |
 
-## Previous Validated Results (NIXL 0.8.0 Patches)
+## Benchmark Results (Dynamo v0.9.0, P5.48xlarge, AIPerf 0.5.0)
+
+All tests: 2x P5.48xlarge cross-node, TRT-LLM 1.3.0rc1, 512 input / 128 output tokens.
+
+### Qwen3-0.6B TP1: UCX (TCP) vs LIBFABRIC (EFA RDMA)
+
+| Conc | UCX-TCP TTFT | LIBFABRIC TTFT | **Speedup** | UCX-TCP Latency | LF Latency |
+|------|-------------|----------------|-------------|-----------------|------------|
+| 1 | 252ms | **76ms** | **3.3x** | 565ms | 358ms |
+| 5 | 695ms | **77ms** | **9.0x** | 1093ms | 516ms |
+| 10 | 1665ms | **90ms** | **18.5x** | 2095ms | 711ms |
+| 20 | 3333ms | **104ms** | **32x** | 3726ms | 2626ms |
+
+### Qwen2.5-7B-Instruct TP1: UCX (TCP) vs LIBFABRIC (EFA RDMA)
+
+| Conc | UCX-TCP TTFT | LIBFABRIC TTFT | **Speedup** | UCX-TCP Latency | LF Latency |
+|------|-------------|----------------|-------------|-----------------|------------|
+| 1 | 146ms | **76ms** | **1.9x** | 959ms | 850ms |
+| 5 | 179ms | **80ms** | **2.2x** | 1048ms | 930ms |
+| 10 | 278ms | **126ms** | **2.2x** | 1188ms | 1011ms |
+| 20 | 1203ms | **214ms** | **5.6x** | 2110ms | 2709ms |
+
+### Important: UCX Transport Caveat
+
+> **The UCX baseline used TCP transport (`UCX_TLS=tcp,...`), which is the Dynamo
+> default.** UCX supports RDMA via EFA (`UCX_TLS=rc,ud,...`) but this was NOT
+> tested. The TTFT speedup (2-32x) includes both the RDMA advantage AND TCP
+> stack elimination. A fair UCX-RDMA vs LIBFABRIC-RDMA comparison would likely
+> show a smaller but still significant gap.
+>
+> To enable UCX RDMA over EFA:
+> ```yaml
+> UCX_TLS: "rc,ud,cuda_copy,cuda_ipc,sm,self"
+> ```
+
+### Key Observations
+
+- **TTFT stays flat with LIBFABRIC** (76-214ms) while UCX-TCP scales linearly
+  (252-3333ms) — RDMA bypasses kernel TCP queueing
+- **ITL is similar** between backends (~2.2ms for 0.6B, ~6.1ms for 7B at c=1)
+  because decode is compute-bound, not network-bound
+- **Throughput peaks at c=10** for both backends (~1340 tok/s LIBFABRIC, ~610
+  tok/s UCX-TCP for 0.6B model)
+
+### Previous Results (NIXL 0.8.0 Patches, Jan 2026)
 
 | Framework | Metric | Before (stock) | After (patched+optimized) | Gain |
 |-----------|--------|----------------|---------------------------|------|
