@@ -180,18 +180,22 @@ All tests: 2x P5.48xlarge cross-node, TRT-LLM 1.3.0rc1, 512 input / 128 output t
 | 10 | 278ms | **126ms** | **2.2x** | 1188ms | 1011ms |
 | 20 | 1203ms | **214ms** | **5.6x** | 2110ms | 2709ms |
 
-### Important: UCX Transport Caveat
+### UCX RDMA Test (Fair Comparison)
 
-> **The UCX baseline used TCP transport (`UCX_TLS=tcp,...`), which is the Dynamo
-> default.** UCX supports RDMA via EFA (`UCX_TLS=rc,ud,...`) but this was NOT
-> tested. The TTFT speedup (2-32x) includes both the RDMA advantage AND TCP
-> stack elimination. A fair UCX-RDMA vs LIBFABRIC-RDMA comparison would likely
-> show a smaller but still significant gap.
->
-> To enable UCX RDMA over EFA:
-> ```yaml
-> UCX_TLS: "rc,ud,cuda_copy,cuda_ipc,sm,self"
-> ```
+We also tested UCX with RDMA transport (`UCX_TLS=rc,ud,...`) over EFA, confirmed
+via `ud_verbs/rdmap79s0:1` in UCX logs. Results for Qwen3-0.6B TP1:
+
+| Conc | UCX-TCP TTFT | UCX-RDMA TTFT | LIBFABRIC TTFT | UCX-RDMA vs LF |
+|------|-------------|---------------|----------------|----------------|
+| 1 | 252ms | 260ms | **76ms** | **LF 3.4x faster** |
+| 5 | 695ms | 693ms | **77ms** | **LF 9x faster** |
+| 10 | 1665ms | 1818ms | **90ms** | **LF 20x faster** |
+| 20 | 3333ms | 3420ms | **104ms** | **LF 33x faster** |
+
+> **Key finding:** UCX-RDMA performs identically to UCX-TCP. The bottleneck is
+> NOT the wire transport — it's in the NIXL UCX plugin code path. The LIBFABRIC
+> plugin uses a fundamentally different one-sided RDMA approach that bypasses
+> the UCX connection management overhead.
 
 ### Key Observations
 
