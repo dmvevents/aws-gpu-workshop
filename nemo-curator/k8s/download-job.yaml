@@ -1,0 +1,307 @@
+# Kubernetes Job: Download Wikipedia data for NeMo Curator workshop
+#
+# Downloads a subset of English Wikipedia from HuggingFace's
+# wikimedia/wikipedia dataset via streaming and saves it as JSONL.
+# The download script is injected via a ConfigMap so we can use a
+# stock python:3.11-slim image without building a custom container.
+#
+# Typical runtime: 3-8 minutes on a node with decent egress bandwidth.
+#
+# Tunables (set via env vars on the container):
+#   DATASET_SIZE  - number of articles to download  (default: 50000)
+#   OUTPUT_PATH   - where to write the JSONL file   (default: /data/raw/wikipedia_50k.jsonl)
+#   DATASET_NAME  - HuggingFace dataset identifier  (default: wikimedia/wikipedia)
+#   DATASET_CONFIG - dataset config / subset         (default: 20231101.en)
+#
+# Prerequisites:
+#   kubectl apply -f data-pvc.yaml          # provision storage first
+#   kubectl apply -f download-job.yaml      # then launch this job
+
+---
+# ---- ConfigMap: embeds the download script ---------------------------
+# The Python script is stored here so we don't need a custom image.
+# Any edits to the script only require re-applying this manifest.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workshop-download-script
+  namespace: default
+  labels:
+    app: nemo-curator-workshop
+    component: download
+data:
+  download_wikipedia.py: |
+    #!/usr/bin/env python3
+    """
+    Download Wikipedia articles from HuggingFace and save as JSONL.
+
+    Streams the dataset to avoid loading the full dump into memory.
+    Designed for the NeMo Curator workshop -- downloads a manageable
+    subset (~50K articles) that can be processed in a 90-minute session.
+    """
+
+    import argparse
+    import json
+    import os
+    import signal
+    import sys
+    import time
+    from pathlib import Path
+
+
+    def parse_args() -> argparse.Namespace:
+        parser = argparse.ArgumentParser(
+            description="Download Wikipedia articles from HuggingFace and save as JSONL."
+        )
+        parser.add_argument(
+            "--output",
+            type=str,
+            default=os.environ.get("OUTPUT_PATH", "/data/raw/wikipedia_50k.jsonl"),
+            help="Output JSONL file path.",
+        )
+        parser.add_argument(
+            "--max-records",
+            type=int,
+            default=int(os.environ.get("DATASET_SIZE", "50000")),
+            help="Maximum number of records to download.",
+        )
+        parser.add_argument(
+            "--dataset-name",
+            type=str,
+            default=os.environ.get("DATASET_NAME", "wikimedia/wikipedia"),
+            help="HuggingFace dataset name.",
+        )
+        parser.add_argument(
+            "--dataset-config",
+            type=str,
+            default=os.environ.get("DATASET_CONFIG", "20231101.en"),
+            help="Dataset configuration / subset name.",
+        )
+        return parser.parse_args()
+
+
+    def main() -> None:
+        args = parse_args()
+
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            print(
+                "ERROR: 'datasets' library not found. Install with: pip install datasets",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Graceful shutdown on SIGINT / SIGTERM
+        shutdown_requested = False
+
+        def _handle_signal(signum, _frame):
+            nonlocal shutdown_requested
+            sig_name = signal.Signals(signum).name
+            print(f"\n[SIGNAL] Received {sig_name} -- finishing current record and exiting.")
+            shutdown_requested = True
+
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
+
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        print("=" * 60)
+        print("Wikipedia Download for NeMo Curator Workshop")
+        print("=" * 60)
+        print(f"  Dataset:       {args.dataset_name} ({args.dataset_config})")
+        print(f"  Max records:   {args.max_records:,}")
+        print(f"  Output:        {output_path}")
+        print("=" * 60)
+        print()
+
+        print("Connecting to HuggingFace and starting stream...")
+        t_start = time.time()
+
+        dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config,
+            split="train",
+            streaming=True,
+            trust_remote_code=True,
+        )
+
+        records_written = 0
+        total_bytes = 0
+
+        with open(output_path, "w", encoding="utf-8") as fout:
+            for item in dataset:
+                if shutdown_requested or records_written >= args.max_records:
+                    break
+
+                record = {
+                    "id": str(item.get("id", records_written)),
+                    "title": item.get("title", ""),
+                    "text": item.get("text", ""),
+                    "url": item.get("url", ""),
+                    "timestamp": args.dataset_config.split(".")[0],
+                }
+
+                line = json.dumps(record, ensure_ascii=False)
+                fout.write(line + "\n")
+                total_bytes += len(line.encode("utf-8")) + 1
+                records_written += 1
+
+                if records_written % 5000 == 0:
+                    elapsed = time.time() - t_start
+                    rate = records_written / elapsed if elapsed > 0 else 0
+                    mb = total_bytes / (1024 * 1024)
+                    print(
+                        f"  [{records_written:>7,} / {args.max_records:,}]  "
+                        f"{mb:,.1f} MB written  |  {rate:,.0f} records/s  |  "
+                        f"{elapsed:,.0f}s elapsed"
+                    )
+
+        elapsed = time.time() - t_start
+        mb = total_bytes / (1024 * 1024)
+        avg_len = total_bytes / records_written if records_written > 0 else 0
+
+        print()
+        print("=" * 60)
+        print("Download Complete")
+        print("=" * 60)
+        print(f"  Records written:    {records_written:,}")
+        print(f"  Total size:         {mb:,.1f} MB")
+        print(f"  Avg record size:    {avg_len:,.0f} bytes")
+        print(f"  Elapsed time:       {elapsed:,.1f}s")
+        if elapsed > 0:
+            print(f"  Throughput:         {records_written / elapsed:,.0f} records/s")
+        print(f"  Output file:        {output_path}")
+        if shutdown_requested:
+            print("  NOTE: Interrupted -- output is partial but valid JSONL.")
+        print("=" * 60)
+
+
+    if __name__ == "__main__":
+        main()
+
+---
+# ---- Job: runs the download ----------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: workshop-download-wikipedia
+  namespace: default
+  labels:
+    app: nemo-curator-workshop
+    component: download
+spec:
+  backoffLimit: 2                    # Retry twice on transient failures
+  ttlSecondsAfterFinished: 3600     # Auto-cleanup 1 hour after completion
+  completions: 1
+  parallelism: 1
+
+  template:
+    metadata:
+      labels:
+        app: nemo-curator-workshop
+        component: download
+    spec:
+      restartPolicy: OnFailure
+
+      # DNS config for reliable internet access from within the cluster.
+      # Some EKS clusters restrict DNS to cluster-internal by default;
+      # explicit public nameservers ensure HuggingFace is reachable.
+      dnsPolicy: "None"
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 8.8.4.4
+        searches:
+          - default.svc.cluster.local
+          - svc.cluster.local
+          - cluster.local
+        options:
+          - name: ndots
+            value: "2"
+
+      # Init container: ensure the output directory tree exists and is
+      # writable regardless of PVC filesystem state.
+      initContainers:
+        - name: prepare-dirs
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Creating data directories..."
+              mkdir -p /data/raw
+              mkdir -p /data/curated
+              mkdir -p /data/export
+              chmod -R 777 /data
+              echo "Directories ready."
+          volumeMounts:
+            - name: data-volume
+              mountPath: /data
+
+      # Main container: install dependencies then run the script.
+      containers:
+        - name: downloader
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+
+          # Install the datasets library at startup, then execute the
+          # ConfigMap-mounted script.  Using pip at runtime keeps the
+          # image generic and avoids maintaining a custom Dockerfile.
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              echo "Installing Python dependencies..."
+              pip install --no-cache-dir datasets 2>&1 | tail -1
+              echo "Starting download..."
+              python /scripts/download_wikipedia.py
+
+          # Configurable parameters -- override these to change the
+          # download size or output location without editing the script.
+          env:
+            - name: DATASET_SIZE
+              value: "50000"
+            - name: OUTPUT_PATH
+              value: "/data/raw/wikipedia_50k.jsonl"
+            - name: DATASET_NAME
+              value: "wikimedia/wikipedia"
+            - name: DATASET_CONFIG
+              value: "20231101.en"
+            - name: PYTHONUNBUFFERED
+              value: "1"            # Flush print() immediately for live logs
+            - name: HF_HOME
+              value: "/tmp/hf"      # Avoid writing to non-writable home dirs
+
+          # Resource limits -- downloading + JSON serialisation is light.
+          # 2 CPUs handle the streaming iterator and I/O comfortably;
+          # 4Gi RAM provides headroom for the datasets library's internal
+          # buffering without risking OOMKill.
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+          volumeMounts:
+            # PVC for persisted output
+            - name: data-volume
+              mountPath: /data
+            # ConfigMap with the download script
+            - name: script-volume
+              mountPath: /scripts
+              readOnly: true
+
+      volumes:
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: workshop-data-pvc
+
+        - name: script-volume
+          configMap:
+            name: workshop-download-script
+            defaultMode: 0755        # Make the script executable

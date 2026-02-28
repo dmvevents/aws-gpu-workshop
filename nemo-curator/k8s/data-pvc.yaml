@@ -1,0 +1,24 @@
+# PersistentVolumeClaim for NeMo Curator workshop data
+# Provides shared storage for raw downloads, intermediate curation
+# artifacts, and final curated output across all workshop stages.
+#
+# StorageClass gp3 provisions AWS EBS gp3 volumes (3000 IOPS baseline,
+# 125 MB/s throughput) which is more than sufficient for JSONL I/O.
+# 100Gi gives headroom for the raw Wikipedia dump (~4-6 GB uncompressed
+# at 50K articles) plus all intermediate outputs.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workshop-data-pvc
+  namespace: default
+  labels:
+    app: nemo-curator-workshop
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce        # Single-node access is fine for a Job
+  storageClassName: gp3    # AWS EBS gp3
+  resources:
+    requests:
+      storage: 100Gi

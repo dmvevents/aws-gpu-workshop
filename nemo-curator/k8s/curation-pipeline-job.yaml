@@ -1,0 +1,231 @@
+# Kubernetes Job: Full NeMo Curator Workshop Pipeline
+#
+# Runs all 6 phases sequentially in a single pod:
+#   download -> extract -> dedup -> filter -> classify -> export
+#
+# The pipeline scripts are injected via a ConfigMap. Data is persisted
+# on the workshop-data-pvc PersistentVolumeClaim between phases.
+#
+# Prerequisites:
+#   kubectl apply -f data-pvc.yaml
+#   kubectl create configmap workshop-pipeline-scripts \
+#       --from-file=download_wikipedia.py=../scripts/download_wikipedia.py \
+#       --from-file=extract_text.py=../scripts/extract_text.py \
+#       --from-file=dedup_pipeline.py=../scripts/dedup_pipeline.py \
+#       --from-file=filter_quality.py=../scripts/filter_quality.py \
+#       --from-file=classify_domains.py=../scripts/classify_domains.py \
+#       --from-file=export_dataset.py=../scripts/export_dataset.py
+#
+#   kubectl apply -f curation-pipeline-job.yaml
+#
+# Tunables (env vars on the container):
+#   DATASET_SIZE   - number of articles to download  (default: 50000)
+#   FILTER_PRESET  - quality filter preset           (default: moderate)
+#   JACCARD_THRESH - fuzzy dedup threshold           (default: 0.8)
+#   TRAIN_RATIO    - train split fraction            (default: 0.95)
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: workshop-curation-pipeline
+  namespace: default
+  labels:
+    app: nemo-curator-workshop
+    component: full-pipeline
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 7200    # Auto-cleanup after 2 hours
+  completions: 1
+  parallelism: 1
+
+  template:
+    metadata:
+      labels:
+        app: nemo-curator-workshop
+        component: full-pipeline
+    spec:
+      restartPolicy: OnFailure
+
+      # DNS for reliable internet access (HuggingFace download)
+      dnsPolicy: "None"
+      dnsConfig:
+        nameservers:
+          - 8.8.8.8
+          - 8.8.4.4
+        searches:
+          - default.svc.cluster.local
+          - svc.cluster.local
+          - cluster.local
+        options:
+          - name: ndots
+            value: "2"
+
+      # Init: create directory tree on PVC
+      initContainers:
+        - name: prepare-dirs
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Creating pipeline data directories..."
+              mkdir -p /data/raw /data/extracted /data/deduped
+              mkdir -p /data/filtered /data/classified /data/export
+              chmod -R 777 /data
+              echo "Directories ready."
+          volumeMounts:
+            - name: data-volume
+              mountPath: /data
+
+      # Main: run the full pipeline
+      containers:
+        - name: pipeline
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              echo "=============================================="
+              echo "  NeMo Curator Workshop - Full Pipeline"
+              echo "=============================================="
+              echo ""
+
+              # Install dependencies
+              echo ">> Installing Python dependencies..."
+              pip install --no-cache-dir \
+                  datasets \
+                  pandas \
+                  "fasttext-wheel>=0.9.2" \
+                  "datasketch>=1.6.0" \
+                  "beautifulsoup4>=4.12.0" \
+                  lxml \
+                  tqdm \
+                  2>&1 | tail -5
+              echo ""
+
+              # Download fastText language ID model
+              echo ">> Downloading fastText language model..."
+              mkdir -p /models
+              curl -fsSL -o /models/lid.176.ftz \
+                  https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
+              export FASTTEXT_MODEL=/models/lid.176.ftz
+              echo "  Model size: $(du -h /models/lid.176.ftz | cut -f1)"
+              echo ""
+
+              # Phase 01: Download
+              echo ">> Phase 01: Download..."
+              python /scripts/download_wikipedia.py \
+                  --output /data/raw/wikipedia.jsonl \
+                  --max-records "${DATASET_SIZE}"
+              echo ""
+
+              # Phase 02: Extract
+              echo ">> Phase 02: Extract and clean text..."
+              python /scripts/extract_text.py \
+                  --input /data/raw/wikipedia.jsonl \
+                  --output /data/extracted/extracted.jsonl \
+                  --fasttext-model "${FASTTEXT_MODEL}"
+              echo ""
+
+              # Phase 03: Dedup
+              echo ">> Phase 03: Deduplication..."
+              python /scripts/dedup_pipeline.py \
+                  --input /data/extracted/extracted.jsonl \
+                  --output /data/deduped/deduped.jsonl \
+                  --jaccard-threshold "${JACCARD_THRESH}"
+              echo ""
+
+              # Phase 04: Filter
+              echo ">> Phase 04: Quality filtering..."
+              python /scripts/filter_quality.py \
+                  --input /data/deduped/deduped.jsonl \
+                  --output /data/filtered/filtered.jsonl \
+                  --preset "${FILTER_PRESET}"
+              echo ""
+
+              # Phase 05: Classify
+              echo ">> Phase 05: Domain classification..."
+              python /scripts/classify_domains.py \
+                  --input /data/filtered/filtered.jsonl \
+                  --output /data/classified/classified.jsonl
+              echo ""
+
+              # Phase 06: Export
+              echo ">> Phase 06: Export and validation..."
+              python /scripts/export_dataset.py \
+                  --input /data/classified/classified.jsonl \
+                  --output-dir /data/export \
+                  --train-ratio "${TRAIN_RATIO}"
+              echo ""
+
+              # Summary
+              echo "=============================================="
+              echo "  Pipeline Complete - Data Summary"
+              echo "=============================================="
+              echo ""
+              for stage in raw extracted deduped filtered classified; do
+                  if [ -f "/data/${stage}/"*.jsonl ]; then
+                      count=$(wc -l < /data/${stage}/*.jsonl 2>/dev/null || echo 0)
+                      echo "  ${stage}: ${count} records"
+                  fi
+              done
+              echo ""
+              echo "  Export splits:"
+              for split in train validation test; do
+                  if [ -f "/data/export/${split}.jsonl" ]; then
+                      count=$(wc -l < "/data/export/${split}.jsonl")
+                      size=$(du -h "/data/export/${split}.jsonl" | cut -f1)
+                      echo "    ${split}: ${count} records (${size})"
+                  fi
+              done
+              echo ""
+              echo "  Stats: /data/export/dataset_stats.json"
+              cat /data/export/dataset_stats.json 2>/dev/null || true
+              echo ""
+              echo "=============================================="
+              echo "  DONE"
+              echo "=============================================="
+
+          env:
+            - name: DATASET_SIZE
+              value: "50000"
+            - name: FILTER_PRESET
+              value: "moderate"
+            - name: JACCARD_THRESH
+              value: "0.8"
+            - name: TRAIN_RATIO
+              value: "0.95"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HF_HOME
+              value: "/tmp/hf"
+
+          resources:
+            requests:
+              cpu: "2"
+              memory: "8Gi"
+            limits:
+              cpu: "4"
+              memory: "16Gi"
+
+          volumeMounts:
+            - name: data-volume
+              mountPath: /data
+            - name: script-volume
+              mountPath: /scripts
+              readOnly: true
+
+      volumes:
+        - name: data-volume
+          persistentVolumeClaim:
+            claimName: workshop-data-pvc
+
+        - name: script-volume
+          configMap:
+            name: workshop-pipeline-scripts
+            defaultMode: 0755
